@@ -25,137 +25,158 @@ void AMGMapGenerator::DestroyMap()
 void AMGMapGenerator::GenerateMap()
 {
     DestroyMap();
-    
-    TArray<FVector2D> Vertices;
-    TArray<TPair<int32, int32>> Edges;
-    GenerateDelaunayTriangulation(Vertices, Edges);
 
-    TArray<int32> TreeEdges;
-    GenerateMinimumSpanningTree(Vertices, Edges, TreeEdges);
-
-    SpawnMapGeometry(Vertices, TreeEdges);
-}
-
-void AMGMapGenerator::GenerateDelaunayTriangulation(TArray<FVector2D>& OutVertices, TArray<TPair<int32, int32>>& OutEdges)
-{
-    // Generate Random points in map area
-    OutVertices.SetNum(NumVertices);
-    for (int32 i = 0; i < NumVertices; ++i)
+    // Generate random points
+    TArray<FVector2D> Points;
+    Points.SetNum(NumPoints);
+    for (int32 i = 0; i < NumPoints; i++)
     {
-        OutVertices[i] = FVector2D(FMath::RandRange(-MapSize, MapSize), FMath::RandRange(-MapSize, MapSize));
+        Points[i] = FVector2D(
+            FMath::FRandRange(-MapSize, MapSize),
+            FMath::FRandRange(-MapSize, MapSize)
+        );
     }
 
-    // Use Delauney Geometry implementation for Delauney triangulation
-    UE::Geometry::FDelaunay2 Delaunay;
-    bool bSuccess = Delaunay.Triangulate(OutVertices);
+    // Generate Voronoi cells
+    TArray<TArray<FVector2D>> VoronoiCells;
+    GenerateVoronoiDiagram(Points, VoronoiCells);
 
-    // If Delauney triangulation succeed, add triangles edges in OutEdges array
+    // Calculate MST
+    TArray<FEdgeData> MSTEdges;
+    CalculateMinimumSpanningTree(Points, MSTEdges);
+
+    // Spawn map elements
+    SpawnRoomsAndPaths(Points, MSTEdges);
+}
+
+void AMGMapGenerator::GenerateVoronoiDiagram(TArray<FVector2D>& Points, TArray<TArray<FVector2D>>& VoronoiCells)
+{
+    UE::Geometry::FDelaunay2 Delaunay;
+    Delaunay.bAutomaticallyFixEdgesToDuplicateVertices = true;
+    bool bSuccess = Delaunay.Triangulate(Points);
+    
     if (bSuccess)
     {
-        const TArray<UE::Geometry::FIndex3i>& Triangles = Delaunay.GetTriangles();
-        for (const auto& Triangle : Triangles)
+        UE::Geometry::FAxisAlignedBox2d Bounds;
+        Bounds.Min = FVector2D(-MapSize, -MapSize);
+        Bounds.Max = FVector2D(MapSize, MapSize);
+        VoronoiCells = Delaunay.GetVoronoiCells(Points, true, UE::Geometry::FAxisAlignedBox2d(Bounds), 0);
+    }
+}
+
+void AMGMapGenerator::CalculateMinimumSpanningTree(const TArray<FVector2D>& Points, TArray<FEdgeData>& MSTEdges)
+{
+    TArray<bool> Visited;
+    Visited.Init(false, Points.Num());
+    
+    // Priority queue for Prim's algorithm
+    TArray<FEdgeData> PriorityQueue;
+    float TotalMSTWeight = 0.0f;
+    
+    // Start with first vertex
+    Visited[0] = true;
+    
+    // Add all edges from first vertex
+    for (int32 i = 1; i < Points.Num(); i++)
+    {
+        float Distance = FVector2D::Distance(Points[0], Points[i]);
+        PriorityQueue.Add(FEdgeData(0, i, Distance)); 
+        UE_LOG(LogTemp, Log, TEXT("Add Edge (0, %d) with weight %f"), i, Distance);
+    }
+    
+    // Prim's algorithm
+    while (PriorityQueue.Num() > 0)
+    {
+        // Find minimum weight edge
+        float MinWeight = MAX_FLT;
+        int32 MinIndex = -1;
+        
+        for (int32 i = 0; i < PriorityQueue.Num(); i++)
         {
-            OutEdges.Add(TPair<int32, int32>(Triangle.A, Triangle.B));
-            OutEdges.Add(TPair<int32, int32>(Triangle.B, Triangle.C));
-            OutEdges.Add(TPair<int32, int32>(Triangle.C, Triangle.A));
+            if (PriorityQueue[i].Weight < MinWeight)
+            {
+                MinWeight = PriorityQueue[i].Weight;
+                MinIndex = i;
+            }
+        }
+        
+        if (MinIndex == -1) break;
+        
+        FEdgeData CurrentEdge = PriorityQueue[MinIndex];
+        PriorityQueue.RemoveAt(MinIndex);
+        
+        // Check if it create cycle  
+        if (Visited[CurrentEdge.VertexB])
+        {
+            UE_LOG(LogTemp, Log, TEXT("Point (%d, %d) ignored because it create a cycle"), CurrentEdge.VertexA, CurrentEdge.VertexB);
+            continue;
+        }
+        
+        // Add edge to MST
+        MSTEdges.Add(CurrentEdge);
+        TotalMSTWeight += CurrentEdge.Weight;
+        Visited[CurrentEdge.VertexB] = true;
+        
+        // Add new edges to priority queue
+        for (int32 i = 0; i < Points.Num(); i++)
+        {
+            if (!Visited[i])
+            {
+                float Distance = FVector2D::Distance(Points[CurrentEdge.VertexB], Points[i]);
+                PriorityQueue.Add(FEdgeData(CurrentEdge.VertexB, i, Distance)); 
+                UE_LOG(LogTemp, Log, TEXT("Add Edge (%d, %d) with weight %f"), CurrentEdge.VertexB, i, Distance);
+            }
+        }
+
+        UE_LOG(LogTemp, Log, TEXT("MST ended with %d edge and weight %f"), MSTEdges.Num(), TotalMSTWeight);
+    }
+}
+
+void AMGMapGenerator::SpawnRoomsAndPaths(const TArray<FVector2D>& Points, const TArray<FEdgeData>& MSTEdges)
+{
+    // Spawn rooms at Voronoi vertices
+    for (const FVector2D& Point : Points)
+    {
+        if (PlatformActorClass)
+        {
+            FVector Location(Point.X, Point.Y, 0.0f);
+            FRotator Rotation(0.0f, 0.0f, 0.0f);
+            FActorSpawnParameters SpawnParams;
+            SpawnParams.Owner = this;
+            
+            AActor* Room = GetWorld()->SpawnActor<AActor>(PlatformActorClass, Location, Rotation, SpawnParams);
+            if (Room)
+            {
+                Room->SetActorScale3D(FVector(RoomRadius / 50.0f)); // Assuming default cube size is 100
+                Room->AttachToActor(this, FAttachmentTransformRules::KeepWorldTransform);
+            }
         }
     }
-    else
+
+    // Spawn paths between connected rooms
+    for (const FEdgeData& Edge : MSTEdges)
     {
-        UE_LOG(LogTemp, Error, TEXT("Delaunay triangulation failed"));
-    }
-}
-
-void AMGMapGenerator::GenerateMinimumSpanningTree(const TArray<FVector2D>& Vertices, const TArray<TPair<int32, int32>>& Edges, TArray<int32>& OutTreeEdges)
-{
-    // Create minimum spanning tree
-    TArray<int32> Parent;
-    Parent.Init(-1, Vertices.Num());
-
-    auto Find = [&Parent](int32 i) {
-        while (Parent[i] != -1) i = Parent[i];
-        return i;
-    };
-
-    // Sort edges by length
-    TArray<TPair<int32, int32>> SortedEdges = Edges;
-    SortedEdges.Sort([&Vertices](const TPair<int32, int32>& A, const TPair<int32, int32>& B) {
-        float LengthA = FVector2D::DistSquared(Vertices[A.Key], Vertices[A.Value]);
-        float LengthB = FVector2D::DistSquared(Vertices[B.Key], Vertices[B.Value]);
-        return LengthA < LengthB;
-    });
-
-    // Go through the sorted edges and add them to the minimum spanning tree only if they don't create a cycle
-    for (const auto& Edge : SortedEdges)
-    {
-        int32 SetA = Find(Edge.Key);
-        int32 SetB = Find(Edge.Value);
-
-        if (SetA != SetB)
+        if (PathActorClass)
         {
-            OutTreeEdges.Add(Edge.Key);
-            OutTreeEdges.Add(Edge.Value);
-            Parent[SetA] = SetB;
-        }
-    }
-}
-
-void AMGMapGenerator::SpawnMapGeometry(const TArray<FVector2D>& Vertices, const TArray<int32>& TreeEdges)
-{
-    // Create a platform for all vertices
-    for (const FVector2D& Vertex : Vertices)
-    {
-        SpawnPlatform(Vertex);
-    }
-
-    // Create path between platforms
-    for (int32 i = 0; i < TreeEdges.Num(); i += 2)
-    {
-        SpawnPath(Vertices[TreeEdges[i]], Vertices[TreeEdges[i + 1]]);
-    }
-
-    // Move the player spawn point on first platform to not fall 
-    AActor* PlayerSpawnPoint = UGameplayStatics::GetActorOfClass(GetWorld(), APlayerStart::StaticClass());
-    if(PlayerSpawnPoint)
-    {
-        PlayerSpawnPoint->SetActorLocation(FVector(Vertices[0].X, Vertices[0].Y, PlatformRadius));
-    }
-}
-
-void AMGMapGenerator::SpawnPlatform(const FVector2D& Location)
-{
-    if (PlatformActorClass)
-    {
-        FVector SpawnLocation(Location.X, Location.Y, 0.0f);
-        FActorSpawnParameters SpawnParams;
-        SpawnParams.Owner = this;
-        AMGPointActor* Platform = GetWorld()->SpawnActor<AMGPointActor>(PlatformActorClass, SpawnLocation, FRotator::ZeroRotator, SpawnParams);
-        if (Platform)
-        {
-            Platform->SetActorScale3D(FVector(PlatformRadius / 50.0f));
-            Platform->AttachToActor(this, FAttachmentTransformRules::KeepRelativeTransform);
-        }
-    }
-}
-
-void AMGMapGenerator::SpawnPath(const FVector2D& Start, const FVector2D& End)
-{
-    if (PathActorClass)
-    {
-        FVector StartLocation(Start.X, Start.Y, 0.0f);
-        FVector EndLocation(End.X, End.Y, 0.0f);
-        FVector MidPoint = (StartLocation + EndLocation) / 2.0f;
-        float PathLength = FVector::Dist(StartLocation, EndLocation);
-
-        FActorSpawnParameters SpawnParams;
-        SpawnParams.Owner = this;
-        AMGPointActor* Path = GetWorld()->SpawnActor<AMGPointActor>(PathActorClass, MidPoint, FRotator::ZeroRotator, SpawnParams);
-        if (Path)
-        {
-            FRotator PathRotation = UKismetMathLibrary::FindLookAtRotation(StartLocation, EndLocation);
-            Path->SetActorRotation(PathRotation);
-            Path->SetActorScale3D(FVector(PathLength / 100.0f, PathWidth / 100.0f, 1.0f));
-            Path->AttachToActor(this, FAttachmentTransformRules::KeepRelativeTransform);
+            FVector Start(Points[Edge.VertexA].X, Points[Edge.VertexA].Y, 0.0f);
+            FVector End(Points[Edge.VertexB].X, Points[Edge.VertexB].Y, 0.0f);
+            
+            FVector Direction = End - Start;
+            float Distance = Direction.Size();
+            Direction.Normalize();
+            
+            FVector Location = Start + Direction * (Distance / 2.0f);
+            FRotator Rotation = Direction.Rotation();
+            
+            FActorSpawnParameters SpawnParams;
+            SpawnParams.Owner = this;
+            
+            AActor* Path = GetWorld()->SpawnActor<AActor>(PathActorClass, Location, Rotation, SpawnParams);
+            if (Path)
+            {
+                Path->SetActorScale3D(FVector(Distance / 100.0f, PathWidth / 100.0f, 1.0f));
+                Path->AttachToActor(this, FAttachmentTransformRules::KeepWorldTransform);
+            }
         }
     }
 }
